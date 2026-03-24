@@ -39,6 +39,10 @@ pub struct ServiceSettings {
     pub wigle_api_name: String,
     pub wigle_api_token: String,
     pub its_api_key: String,
+    pub openshipdata_api_key: String,
+    pub celestrak_group: String,
+    pub spacetrack_identity: String,
+    pub spacetrack_password: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -386,5 +390,9 @@ mod tests {
         assert_eq!(app_state.services.wigle_api_name, "");
         assert_eq!(app_state.services.wigle_api_token, "");
         assert_eq!(app_state.services.its_api_key, "");
+        assert_eq!(app_state.services.openshipdata_api_key, "");
+        assert_eq!(app_state.services.celestrak_group, "");
+        assert_eq!(app_state.services.spacetrack_identity, "");
+        assert_eq!(app_state.services.spacetrack_password, "");
     }
 }

@@ -1,11 +1,17 @@
 mod app;
+mod cctv_viewer;
 mod commands;
 mod domain;
+mod evidence;
+mod evidence_preview;
+mod fonts;
 mod import_export;
 mod inspector;
 mod interactions;
 mod its_cctv;
 mod map;
+mod openshipdata;
+mod satellites;
 mod storage;
 mod timeline;
 mod traffic;
@@ -29,6 +35,7 @@ fn main() -> eframe::Result<()> {
         native_options,
         Box::new(|cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
+            fonts::install_cjk_fallbacks(&cc.egui_ctx);
             Ok(Box::new(app::VantageApp::new(cc)))
         }),
     )

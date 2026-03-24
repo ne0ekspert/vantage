@@ -1,7 +1,11 @@
 use egui::{vec2, Color32, Pos2, Rect, Sense, Stroke, Ui};
+use glam::{Vec2, Vec3};
 
 use crate::commands::WorkspaceCommand;
 use crate::domain::{GeoPoint, Geometry, Workspace};
+use crate::evidence::{
+    evidence_image_line_segments, evidence_perspective_corners, is_evidence_feature,
+};
 use crate::interactions::{
     DragTarget, EditMode, InteractionState, PendingGeometryEdit, VertexSelection,
 };
@@ -131,6 +135,27 @@ impl Wgpu3dMapEngine {
                         2.0 + if selected { 1.0 } else { 0.0 },
                         stroke,
                     );
+                }
+            }
+
+            if is_evidence_feature(feature) {
+                let evidence_segments = projected_evidence_segments(projector, feature);
+                if !evidence_segments.is_empty() {
+                    let line_color = if selected {
+                        [0.98, 0.89, 0.30, 0.98]
+                    } else {
+                        [0.98, 0.74, 0.18, 0.9]
+                    };
+                    for segment in evidence_segments {
+                        scene.push_polyline(&segment, if selected { 4.8 } else { 3.4 }, line_color);
+                    }
+                    if let Some(corners) = evidence_perspective_world_corners(projector, feature) {
+                        scene.push_polyline(
+                            &closed_world_points(&corners),
+                            if selected { 2.5 } else { 1.8 },
+                            [line_color[0], line_color[1], line_color[2], 0.34],
+                        );
+                    }
                 }
             }
         }
@@ -652,7 +677,78 @@ fn feature_anchor_screen(
     }
 }
 
-fn closed_world_points<const N: usize>(points: &[glam::Vec3; N]) -> Vec<glam::Vec3> {
+fn evidence_perspective_world_corners(
+    projector: &MapProjector,
+    feature: &crate::domain::Feature,
+) -> Option<[Vec3; 4]> {
+    let corners = evidence_perspective_corners(feature)?;
+    Some(corners.map(|corner| projector.geo_to_world(corner)))
+}
+
+fn projected_evidence_segments(
+    projector: &MapProjector,
+    feature: &crate::domain::Feature,
+) -> Vec<[Vec3; 2]> {
+    let segments = evidence_image_line_segments(feature);
+    if segments.is_empty() {
+        return Vec::new();
+    }
+
+    let Some(quad) = evidence_perspective_world_corners(projector, feature) else {
+        return Vec::new();
+    };
+
+    segments
+        .into_iter()
+        .map(|segment| {
+            [
+                projective_quad_point(quad, segment.start),
+                projective_quad_point(quad, segment.end),
+            ]
+        })
+        .collect()
+}
+
+fn projective_quad_point(quad: [Vec3; 4], uv: [f32; 2]) -> Vec3 {
+    let projected = map_unit_square_to_quad(
+        Vec2::new(quad[0].x, quad[0].z),
+        Vec2::new(quad[1].x, quad[1].z),
+        Vec2::new(quad[2].x, quad[2].z),
+        Vec2::new(quad[3].x, quad[3].z),
+        uv[0].clamp(0.0, 1.0),
+        uv[1].clamp(0.0, 1.0),
+    );
+    let elevation = (quad[0].y + quad[1].y + quad[2].y + quad[3].y) * 0.25 + 1.0;
+    Vec3::new(projected.x, elevation, projected.y)
+}
+
+fn map_unit_square_to_quad(p0: Vec2, p1: Vec2, p2: Vec2, p3: Vec2, u: f32, v: f32) -> Vec2 {
+    let s = p0 - p1 + p2 - p3;
+    if s.length_squared() <= 1e-6 {
+        return p0 + (p1 - p0) * u + (p3 - p0) * v;
+    }
+
+    let delta1 = p1 - p2;
+    let delta2 = p3 - p2;
+    let denominator = delta1.x * delta2.y - delta2.x * delta1.y;
+    if denominator.abs() <= 1e-6 {
+        return p0 + (p1 - p0) * u + (p3 - p0) * v;
+    }
+
+    let g = (s.x * delta2.y - delta2.x * s.y) / denominator;
+    let h = (delta1.x * s.y - s.x * delta1.y) / denominator;
+    let a = p1.x - p0.x + g * p1.x;
+    let b = p3.x - p0.x + h * p3.x;
+    let c = p0.x;
+    let d = p1.y - p0.y + g * p1.y;
+    let e = p3.y - p0.y + h * p3.y;
+    let f = p0.y;
+    let divisor = (g * u + h * v + 1.0).max(1e-6);
+
+    Vec2::new((a * u + b * v + c) / divisor, (d * u + e * v + f) / divisor)
+}
+
+fn closed_world_points<const N: usize>(points: &[Vec3; N]) -> Vec<Vec3> {
     let mut closed = points.to_vec();
     if let Some(first) = points.first() {
         closed.push(*first);
@@ -660,7 +756,7 @@ fn closed_world_points<const N: usize>(points: &[glam::Vec3; N]) -> Vec<glam::Ve
     closed
 }
 
-fn closed_world_points_vec(points: &[glam::Vec3]) -> Vec<glam::Vec3> {
+fn closed_world_points_vec(points: &[Vec3]) -> Vec<Vec3> {
     let mut closed = points.to_vec();
     if let Some(first) = points.first() {
         closed.push(*first);
@@ -766,4 +862,58 @@ fn point_in_polygon(point: Pos2, polygon: &[Pos2]) -> bool {
         j = i;
     }
     inside
+}
+
+#[cfg(test)]
+mod tests {
+    use glam::Vec2;
+
+    use super::map_unit_square_to_quad;
+
+    fn assert_close(actual: Vec2, expected: Vec2) {
+        assert!(
+            (actual - expected).length() <= 1e-4,
+            "{actual:?} != {expected:?}"
+        );
+    }
+
+    #[test]
+    fn projective_mapping_hits_quad_corners() {
+        let quad = [
+            Vec2::new(10.0, 20.0),
+            Vec2::new(110.0, 30.0),
+            Vec2::new(120.0, 130.0),
+            Vec2::new(0.0, 120.0),
+        ];
+
+        assert_close(
+            map_unit_square_to_quad(quad[0], quad[1], quad[2], quad[3], 0.0, 0.0),
+            quad[0],
+        );
+        assert_close(
+            map_unit_square_to_quad(quad[0], quad[1], quad[2], quad[3], 1.0, 0.0),
+            quad[1],
+        );
+        assert_close(
+            map_unit_square_to_quad(quad[0], quad[1], quad[2], quad[3], 1.0, 1.0),
+            quad[2],
+        );
+        assert_close(
+            map_unit_square_to_quad(quad[0], quad[1], quad[2], quad[3], 0.0, 1.0),
+            quad[3],
+        );
+    }
+
+    #[test]
+    fn affine_quad_midpoint_stays_centered() {
+        let mapped = map_unit_square_to_quad(
+            Vec2::new(0.0, 0.0),
+            Vec2::new(4.0, 0.0),
+            Vec2::new(4.0, 2.0),
+            Vec2::new(0.0, 2.0),
+            0.5,
+            0.5,
+        );
+        assert_close(mapped, Vec2::new(2.0, 1.0));
+    }
 }

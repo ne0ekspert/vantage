@@ -1,28 +1,69 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::time::Instant;
 
 use chrono::Utc;
 use eframe::egui::{self, CentralPanel, Context, SidePanel, Slider, TopBottomPanel};
 use eframe::{App, CreationContext, Frame};
+use rfd::FileDialog;
 
+use crate::cctv_viewer::{viewer_target_from_feature, ItsCctvViewer};
 use crate::commands::{CommandHistory, WorkspaceCommand};
 use crate::domain::{sample_workspace, Geometry, LayerType, MapCamera, Workspace};
+use crate::evidence::{import_evidence_file, is_evidence_feature};
+use crate::evidence_preview::{evidence_preview_target_from_feature, EvidenceImagePreview};
 use crate::import_export::{
-    apply_its_cctv, apply_wigle_networks, clear_its_cctv_layer, clear_wigle_layer, import_gpx_file,
-    its_cctv_feature_count, wigle_feature_count,
+    apply_its_cctv, apply_openshipdata, apply_satellites, apply_wigle_networks,
+    clear_its_cctv_layer, clear_openshipdata_layer, clear_satellite_layer, clear_wigle_layer,
+    import_gpx_file, its_cctv_feature_count, openshipdata_feature_count, satellite_feature_count,
+    wigle_feature_count,
 };
 use crate::inspector::show_inspector;
 use crate::interactions::{EditMode, InteractionState, VertexSelection};
 use crate::its_cctv::{ItsCctvManager, ItsRoadType};
 use crate::map::{MapEngine, Wgpu3dMapEngine};
+use crate::openshipdata::OpenShipDataManager;
+use crate::satellites::{CelesTrakManager, SatelliteSource, SpaceTrackManager};
 use crate::storage::SqliteWorkspaceStore;
 use crate::timeline::{
     advance_playback, event_is_active, feature_is_active, scrub_fraction_to_time, time_to_fraction,
 };
 use crate::traffic::{GeoBounds, TrafficFilterMode, TrafficManager};
 use crate::wigle::WigleManager;
+
+const INSPECTOR_DEFAULT_WIDTH: f32 = 320.0;
+const INSPECTOR_MIN_WIDTH: f32 = 280.0;
+const INSPECTOR_MAX_WIDTH: f32 = 640.0;
+
+#[derive(Clone)]
+struct EvidenceLayerItem {
+    feature_id: String,
+    feature_name: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsPage {
+    LiveTraffic,
+    Wigle,
+    ItsCctv,
+    OpenShipData,
+    CelesTrak,
+    SpaceTrack,
+}
+
+impl SettingsPage {
+    fn title(self) -> &'static str {
+        match self {
+            SettingsPage::LiveTraffic => "Live Traffic",
+            SettingsPage::Wigle => "WiGLE",
+            SettingsPage::ItsCctv => "ITS CCTV HLS",
+            SettingsPage::OpenShipData => "OpenShipData",
+            SettingsPage::CelesTrak => "CelesTrak Satellites",
+            SettingsPage::SpaceTrack => "Space-Track Satellites",
+        }
+    }
+}
 
 pub struct VantageApp {
     workspace: Workspace,
@@ -33,9 +74,16 @@ pub struct VantageApp {
     traffic: TrafficManager,
     wigle: WigleManager,
     its_cctv: ItsCctvManager,
+    its_cctv_viewer: ItsCctvViewer,
+    evidence_preview: EvidenceImagePreview,
+    openshipdata: OpenShipDataManager,
+    celestrak: CelesTrakManager,
+    spacetrack: SpaceTrackManager,
     workspace_path_input: String,
-    gpx_path_input: String,
     status_message: String,
+    show_settings_window: bool,
+    selected_settings_page: SettingsPage,
+    inspector_width: f32,
     last_frame: Instant,
     last_map_query_bounds: Option<GeoBounds>,
     last_saved_camera: MapCamera,
@@ -64,6 +112,21 @@ impl VantageApp {
         wigle.settings.api_token = workspace.app_state.services.wigle_api_token.clone();
         let mut its_cctv = ItsCctvManager::default();
         its_cctv.settings.api_key = workspace.app_state.services.its_api_key.clone();
+        let mut openshipdata = OpenShipDataManager::default();
+        openshipdata.settings.api_key = workspace.app_state.services.openshipdata_api_key.clone();
+        let mut celestrak = CelesTrakManager::default();
+        if !workspace
+            .app_state
+            .services
+            .celestrak_group
+            .trim()
+            .is_empty()
+        {
+            celestrak.settings.group = workspace.app_state.services.celestrak_group.clone();
+        }
+        let mut spacetrack = SpaceTrackManager::default();
+        spacetrack.settings.identity = workspace.app_state.services.spacetrack_identity.clone();
+        spacetrack.settings.password = workspace.app_state.services.spacetrack_password.clone();
         let initial_camera = workspace.app_state.camera.clone();
 
         Self {
@@ -78,9 +141,16 @@ impl VantageApp {
             traffic,
             wigle,
             its_cctv,
+            its_cctv_viewer: ItsCctvViewer::default(),
+            evidence_preview: EvidenceImagePreview::default(),
+            openshipdata,
+            celestrak,
+            spacetrack,
             workspace_path_input: workspace_path.to_string_lossy().to_string(),
-            gpx_path_input: String::new(),
             status_message,
+            show_settings_window: false,
+            selected_settings_page: SettingsPage::LiveTraffic,
+            inspector_width: INSPECTOR_DEFAULT_WIDTH,
             last_frame: Instant::now(),
             last_map_query_bounds: None,
             last_saved_camera: initial_camera.clone(),
@@ -120,6 +190,35 @@ impl VantageApp {
         self.wigle.settings.api_name = self.workspace.app_state.services.wigle_api_name.clone();
         self.wigle.settings.api_token = self.workspace.app_state.services.wigle_api_token.clone();
         self.its_cctv.settings.api_key = self.workspace.app_state.services.its_api_key.clone();
+        self.openshipdata.settings.api_key = self
+            .workspace
+            .app_state
+            .services
+            .openshipdata_api_key
+            .clone();
+        if !self
+            .workspace
+            .app_state
+            .services
+            .celestrak_group
+            .trim()
+            .is_empty()
+        {
+            self.celestrak.settings.group =
+                self.workspace.app_state.services.celestrak_group.clone();
+        }
+        self.spacetrack.settings.identity = self
+            .workspace
+            .app_state
+            .services
+            .spacetrack_identity
+            .clone();
+        self.spacetrack.settings.password = self
+            .workspace
+            .app_state
+            .services
+            .spacetrack_password
+            .clone();
     }
 
     fn save_service_settings(&mut self, success_message: &str) {
@@ -201,6 +300,57 @@ impl VantageApp {
         }
     }
 
+    fn start_openshipdata_import(&mut self) {
+        let Some(bounds) = self.last_map_query_bounds else {
+            self.status_message =
+                "Pan or zoom the map first so OpenShipData can use the current view bounds".into();
+            return;
+        };
+
+        match self.openshipdata.request_import(bounds) {
+            Ok(()) => {
+                self.status_message = "Started OpenShipData import for the current map view".into();
+            }
+            Err(error) => {
+                self.status_message = error;
+            }
+        }
+    }
+
+    fn start_celestrak_import(&mut self) {
+        let Some(bounds) = self.last_map_query_bounds else {
+            self.status_message =
+                "Pan or zoom the map first so CelesTrak can use the current view bounds".into();
+            return;
+        };
+
+        match self.celestrak.request_import(bounds) {
+            Ok(()) => {
+                self.status_message = "Started CelesTrak import for the current map view".into();
+            }
+            Err(error) => {
+                self.status_message = error;
+            }
+        }
+    }
+
+    fn start_spacetrack_import(&mut self) {
+        let Some(bounds) = self.last_map_query_bounds else {
+            self.status_message =
+                "Pan or zoom the map first so Space-Track can use the current view bounds".into();
+            return;
+        };
+
+        match self.spacetrack.request_import(bounds) {
+            Ok(()) => {
+                self.status_message = "Started Space-Track import for the current map view".into();
+            }
+            Err(error) => {
+                self.status_message = error;
+            }
+        }
+    }
+
     fn clear_wigle_import_layer(&mut self) {
         let removed = clear_wigle_layer(&mut self.workspace);
         self.sync_selection_from_workspace();
@@ -235,6 +385,47 @@ impl VantageApp {
             Err(error) => {
                 self.status_message =
                     format!("Cleared {removed} ITS CCTV markers but failed to save: {error}");
+            }
+        }
+    }
+
+    fn clear_openshipdata_import_layer(&mut self) {
+        let removed = clear_openshipdata_layer(&mut self.workspace);
+        self.sync_selection_from_workspace();
+        if removed == 0 {
+            self.status_message = "OpenShipData layer is already empty".into();
+            return;
+        }
+
+        match self.save_workspace_quiet() {
+            Ok(()) => {
+                self.status_message = format!("Cleared {removed} OpenShipData ship markers");
+            }
+            Err(error) => {
+                self.status_message = format!(
+                    "Cleared {removed} OpenShipData ship markers but failed to save: {error}"
+                );
+            }
+        }
+    }
+
+    fn clear_satellite_import_layer(&mut self, source: SatelliteSource) {
+        let removed = clear_satellite_layer(&mut self.workspace, source);
+        self.sync_selection_from_workspace();
+        if removed == 0 {
+            self.status_message = format!("{} layer is already empty", source.layer_name());
+            return;
+        }
+
+        match self.save_workspace_quiet() {
+            Ok(()) => {
+                self.status_message = format!("Cleared {removed} {} markers", source.layer_name());
+            }
+            Err(error) => {
+                self.status_message = format!(
+                    "Cleared {removed} {} markers but failed to save: {error}",
+                    source.layer_name()
+                );
             }
         }
     }
@@ -383,18 +574,66 @@ impl VantageApp {
         }
     }
 
-    fn import_gpx(&mut self) {
-        match import_gpx_file(&self.gpx_path_input, &mut self.workspace) {
-            Ok(result) => {
-                self.status_message = format!(
-                    "Imported GPX into layer {} with {} feature(s)",
-                    result.added_layer_id, result.added_feature_count
-                );
+    fn import_file(&mut self) {
+        let Some(path) = FileDialog::new()
+            .add_filter("Supported imports", &["gpx", "jpg", "jpeg", "png"])
+            .add_filter("GPX tracks", &["gpx"])
+            .add_filter("Evidence images", &["jpg", "jpeg", "png"])
+            .pick_file()
+        else {
+            return;
+        };
+
+        self.import_selected_path(&path);
+    }
+
+    fn import_selected_path(&mut self, path: &Path) {
+        let Some(extension) = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_ascii_lowercase())
+        else {
+            self.status_message = format!("Unsupported import file: {}", path.display());
+            return;
+        };
+
+        if extension == "gpx" {
+            match import_gpx_file(path, &mut self.workspace) {
+                Ok(result) => {
+                    self.status_message = format!(
+                        "GPX -> layer {} ({} feature(s))",
+                        result.added_layer_id, result.added_feature_count
+                    );
+                }
+                Err(error) => {
+                    self.status_message = format!("GPX failed: {error}");
+                }
             }
-            Err(error) => {
-                self.status_message = format!("GPX import failed: {error}");
-            }
+            return;
         }
+
+        if is_supported_evidence_extension(&extension) {
+            match import_evidence_file(path, &mut self.workspace) {
+                Ok(result) => {
+                    self.sync_selection_from_workspace();
+                    self.status_message = format!(
+                        "Evidence {} -> layer {}",
+                        result.feature_name, result.layer_id
+                    );
+                }
+                Err(error) => {
+                    self.status_message = format!("Evidence failed: {error}");
+                }
+            }
+            return;
+        }
+
+        self.status_message = format!(
+            "Unsupported import file type: {}",
+            path.extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+        );
     }
 
     fn handle_shortcuts(&mut self, ctx: &Context) {
@@ -479,10 +718,8 @@ impl VantageApp {
                     self.delete_selected_vertex();
                 }
                 ui.separator();
-                ui.label("GPX path");
-                ui.text_edit_singleline(&mut self.gpx_path_input);
-                if ui.button("Import GPX").clicked() {
-                    self.import_gpx();
+                if ui.button("Import").clicked() {
+                    self.import_file();
                 }
                 ui.separator();
                 ui.small("Tiles cache automatically while you browse.");
@@ -503,306 +740,611 @@ impl VantageApp {
             .resizable(true)
             .default_width(280.0)
             .show(ctx, |ui| {
-                ui.heading("Layers");
-                ui.separator();
-
-                let mut pending_move: Option<(usize, isize)> = None;
-                let total_layers = self.workspace.layers.len();
-                let selected_layer_id = self
-                    .interactions
-                    .selected_feature_id
-                    .as_deref()
-                    .and_then(|feature_id| self.workspace.feature(feature_id))
-                    .map(|feature| feature.layer_id.clone());
-                let mut first_feature_by_layer = HashMap::new();
-                for feature in &self.workspace.features {
-                    first_feature_by_layer
-                        .entry(feature.layer_id.clone())
-                        .or_insert_with(|| feature.id.clone());
-                }
-
-                let mut pending_selection: Option<String> = None;
-                for index in 0..total_layers {
-                    let mut select_layer = false;
-                    ui.group(|ui| {
-                        let layer = &mut self.workspace.layers[index];
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.checkbox(&mut layer.visible, "");
-                            let selected = selected_layer_id.as_deref() == Some(layer.id.as_str());
-                            if ui.selectable_label(selected, &layer.name).clicked() {
-                                select_layer = true;
+                            ui.heading("Layers");
+                            ui.separator();
+                            if ui.button("Settings").clicked() {
+                                self.show_settings_window = true;
                             }
                         });
-                        ui.horizontal(|ui| {
-                            ui.small(format!("{:?}", layer.layer_type));
-                            if ui.small_button("Up").clicked() && index > 0 {
-                                pending_move = Some((index, -1));
+                        ui.separator();
+
+                        let mut pending_move: Option<(usize, isize)> = None;
+                        let total_layers = self.workspace.layers.len();
+                        let selected_feature_id =
+                            self.interactions.selected_feature_id.clone().or_else(|| {
+                                self.workspace.app_state.ui.selected_feature_id.clone()
+                            });
+                        let selected_layer_id = self
+                            .interactions
+                            .selected_feature_id
+                            .as_deref()
+                            .and_then(|feature_id| self.workspace.feature(feature_id))
+                            .map(|feature| feature.layer_id.clone());
+                        let mut first_feature_by_layer = HashMap::new();
+                        let mut evidence_items_by_layer: HashMap<String, Vec<EvidenceLayerItem>> =
+                            HashMap::new();
+                        for feature in &self.workspace.features {
+                            first_feature_by_layer
+                                .entry(feature.layer_id.clone())
+                                .or_insert_with(|| feature.id.clone());
+                            if is_evidence_feature(feature) {
+                                evidence_items_by_layer
+                                    .entry(feature.layer_id.clone())
+                                    .or_default()
+                                    .push(EvidenceLayerItem {
+                                        feature_id: feature.id.clone(),
+                                        feature_name: feature.name.clone(),
+                                    });
                             }
-                            if ui.small_button("Down").clicked() && index + 1 < total_layers {
-                                pending_move = Some((index, 1));
+                        }
+
+                        let mut pending_selection: Option<String> = None;
+                        for index in 0..total_layers {
+                            let mut select_layer = false;
+                            ui.group(|ui| {
+                                let layer = &mut self.workspace.layers[index];
+                                ui.horizontal(|ui| {
+                                    ui.checkbox(&mut layer.visible, "");
+                                    let selected =
+                                        selected_layer_id.as_deref() == Some(layer.id.as_str());
+                                    if ui.selectable_label(selected, &layer.name).clicked() {
+                                        select_layer = true;
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.small(format!("{:?}", layer.layer_type));
+                                    if ui.small_button("Up").clicked() && index > 0 {
+                                        pending_move = Some((index, -1));
+                                    }
+                                    if ui.small_button("Down").clicked() && index + 1 < total_layers
+                                    {
+                                        pending_move = Some((index, 1));
+                                    }
+                                });
+                                ui.add(Slider::new(&mut layer.opacity, 0.0..=1.0).text("Opacity"));
+
+                                let total_count = self
+                                    .workspace
+                                    .features
+                                    .iter()
+                                    .filter(|feature| feature.layer_id == layer.id)
+                                    .count();
+                                let active_count = self
+                                    .workspace
+                                    .features
+                                    .iter()
+                                    .filter(|feature| {
+                                        feature.layer_id == layer.id
+                                            && feature_is_active(
+                                                feature,
+                                                self.workspace.app_state.timeline.current_time,
+                                            )
+                                    })
+                                    .count();
+                                ui.small(format!(
+                                    "{} total / {} active",
+                                    total_count, active_count
+                                ));
+
+                                if let Some(items) = evidence_items_by_layer.get(&layer.id) {
+                                    ui.separator();
+                                    egui::CollapsingHeader::new(format!(
+                                        "Evidences ({})",
+                                        items.len()
+                                    ))
+                                    .id_salt(format!("evidence-layer-list-{}", layer.id))
+                                    .default_open(selected_feature_id.as_deref().is_some_and(
+                                        |feature_id| {
+                                            items.iter().any(|item| item.feature_id == feature_id)
+                                        },
+                                    ))
+                                    .show(ui, |ui| {
+                                        for item in items {
+                                            let selected = selected_feature_id.as_deref()
+                                                == Some(item.feature_id.as_str());
+                                            if ui
+                                                .selectable_label(selected, &item.feature_name)
+                                                .clicked()
+                                            {
+                                                pending_selection = Some(item.feature_id.clone());
+                                            }
+                                        }
+                                    });
+                                }
+                            });
+
+                            if select_layer {
+                                let layer_id = self.workspace.layers[index].id.clone();
+                                pending_selection = first_feature_by_layer.get(&layer_id).cloned();
                             }
-                        });
-                        ui.add(Slider::new(&mut layer.opacity, 0.0..=1.0).text("Opacity"));
+                            ui.add_space(6.0);
+                        }
 
-                        let total_count = self
-                            .workspace
-                            .features
-                            .iter()
-                            .filter(|feature| feature.layer_id == layer.id)
-                            .count();
-                        let active_count = self
-                            .workspace
-                            .features
-                            .iter()
-                            .filter(|feature| {
-                                feature.layer_id == layer.id
-                                    && feature_is_active(
-                                        feature,
-                                        self.workspace.app_state.timeline.current_time,
-                                    )
-                            })
-                            .count();
-                        ui.small(format!("{} total / {} active", total_count, active_count));
-                    });
+                        if let Some((index, direction)) = pending_move {
+                            let next = (index as isize + direction) as usize;
+                            self.workspace.layers.swap(index, next);
+                            for (z, layer) in self.workspace.layers.iter_mut().enumerate() {
+                                layer.z_index = (z as i32 + 1) * 10;
+                            }
+                        }
 
-                    if select_layer {
-                        let layer_id = self.workspace.layers[index].id.clone();
-                        pending_selection = first_feature_by_layer.get(&layer_id).cloned();
-                    }
-                    ui.add_space(6.0);
-                }
+                        if let Some(feature_id) = pending_selection {
+                            self.interactions.selected_feature_id = Some(feature_id.clone());
+                            self.workspace.app_state.ui.selected_feature_id = Some(feature_id);
+                        }
 
-                if let Some((index, direction)) = pending_move {
-                    let next = (index as isize + direction) as usize;
-                    self.workspace.layers.swap(index, next);
-                    for (z, layer) in self.workspace.layers.iter_mut().enumerate() {
-                        layer.z_index = (z as i32 + 1) * 10;
-                    }
-                }
-
-                if let Some(feature_id) = pending_selection {
-                    self.interactions.selected_feature_id = Some(feature_id.clone());
-                    self.workspace.app_state.ui.selected_feature_id = Some(feature_id);
-                }
-
-                ui.separator();
-                ui.group(|ui| {
-                    let mut credentials_changed = false;
-                    ui.horizontal(|ui| {
-                        ui.checkbox(&mut self.traffic.settings.enabled, "");
-                        ui.label("Live Traffic");
-                    });
-                    ui.horizontal(|ui| {
-                        ui.small("runtime layer");
                         ui.separator();
-                        ui.small(format!("{} aircraft", self.traffic.aircraft_count()));
-                        if self.traffic.is_pending() {
-                            ui.separator();
-                            ui.small("refreshing");
+                        if ui.button("Add marker").clicked() {
+                            if let Some(layer) = self
+                                .workspace
+                                .layers
+                                .iter()
+                                .find(|layer| layer.layer_type == LayerType::Marker)
+                            {
+                                let mut feature = crate::domain::Feature::new(
+                                    layer.id.clone(),
+                                    crate::domain::FeatureType::Marker,
+                                    "New marker",
+                                    crate::domain::Geometry::Point(
+                                        self.workspace.app_state.camera.center,
+                                    ),
+                                    crate::domain::FeatureStyle::marker(
+                                        egui::Color32::WHITE,
+                                        egui::Color32::from_rgb(251, 146, 60),
+                                        9.0,
+                                    ),
+                                );
+                                feature.time_start = Some(Utc::now());
+                                let feature_id = feature.id.clone();
+                                self.apply_command(WorkspaceCommand::AddFeature { feature });
+                                self.interactions.selected_feature_id = Some(feature_id.clone());
+                                self.workspace.app_state.ui.selected_feature_id = Some(feature_id);
+                            }
                         }
                     });
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(
-                            &mut self.traffic.settings.filter_mode,
-                            TrafficFilterMode::CommercialOnly,
-                            "Commercial",
-                        );
-                        ui.selectable_value(
-                            &mut self.traffic.settings.filter_mode,
-                            TrafficFilterMode::AllAircraft,
-                            "All aircraft",
-                        );
-                    });
-                    ui.checkbox(&mut self.traffic.settings.show_labels, "Traffic labels");
-                    ui.add(
-                        Slider::new(&mut self.traffic.settings.refresh_interval_secs, 5..=300)
-                            .text("Refresh s"),
-                    );
-                    ui.label("OpenSky client ID");
-                    if ui
-                        .text_edit_singleline(&mut self.traffic.settings.client_id)
-                        .changed()
-                    {
-                        credentials_changed = true;
-                    }
-                    ui.label("OpenSky client secret");
-                    if ui
-                        .add(
-                            egui::TextEdit::singleline(&mut self.traffic.settings.client_secret)
-                                .password(true),
-                        )
-                        .changed()
-                    {
-                        credentials_changed = true;
-                    }
-                    self.workspace.app_state.services.opensky_client_id =
-                        self.traffic.settings.client_id.clone();
-                    self.workspace.app_state.services.opensky_client_secret =
-                        self.traffic.settings.client_secret.clone();
-                    if credentials_changed {
-                        self.save_service_settings("Saved OpenSky credentials to workspace");
-                    }
-                    ui.small(&self.traffic.status_message);
-                });
-
-                ui.separator();
-                ui.group(|ui| {
-                    let mut credentials_changed = false;
-                    ui.horizontal(|ui| {
-                        ui.label("WiGLE API");
-                    });
-                    ui.horizontal(|ui| {
-                        ui.small("workspace layer");
-                        ui.separator();
-                        ui.small(format!("{} networks", wigle_feature_count(&self.workspace)));
-                        if self.wigle.is_pending() {
-                            ui.separator();
-                            ui.small("querying");
-                        }
-                    });
-                    ui.label("WiGLE API name");
-                    if ui
-                        .text_edit_singleline(&mut self.wigle.settings.api_name)
-                        .changed()
-                    {
-                        credentials_changed = true;
-                    }
-                    ui.label("WiGLE API token");
-                    if ui
-                        .add(
-                            egui::TextEdit::singleline(&mut self.wigle.settings.api_token)
-                                .password(true),
-                        )
-                        .changed()
-                    {
-                        credentials_changed = true;
-                    }
-                    self.workspace.app_state.services.wigle_api_name =
-                        self.wigle.settings.api_name.clone();
-                    self.workspace.app_state.services.wigle_api_token =
-                        self.wigle.settings.api_token.clone();
-                    if credentials_changed {
-                        self.save_service_settings("Saved WiGLE credentials to workspace");
-                    }
-                    let can_import =
-                        self.last_map_query_bounds.is_some() && !self.wigle.is_pending();
-                    if ui
-                        .add_enabled(can_import, egui::Button::new("Import visible networks"))
-                        .clicked()
-                    {
-                        self.start_wigle_import();
-                    }
-                    if ui.button("Clear WiGLE layer").clicked() {
-                        self.clear_wigle_import_layer();
-                    }
-                    ui.small("Imports the current map viewport into a dedicated marker layer.");
-                    ui.small(&self.wigle.status_message);
-                });
-
-                ui.separator();
-                ui.group(|ui| {
-                    let mut credentials_changed = false;
-                    ui.horizontal(|ui| {
-                        ui.label("ITS CCTV HLS");
-                    });
-                    ui.horizontal(|ui| {
-                        ui.small("workspace layer");
-                        ui.separator();
-                        ui.small(format!(
-                            "{} cameras",
-                            its_cctv_feature_count(&self.workspace)
-                        ));
-                        if self.its_cctv.is_pending() {
-                            ui.separator();
-                            ui.small("querying");
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(
-                            &mut self.its_cctv.settings.road_type,
-                            ItsRoadType::NationalRoad,
-                            "National road",
-                        );
-                        ui.selectable_value(
-                            &mut self.its_cctv.settings.road_type,
-                            ItsRoadType::Expressway,
-                            "Expressway",
-                        );
-                    });
-                    ui.label("ITS API key");
-                    if ui
-                        .add(
-                            egui::TextEdit::singleline(&mut self.its_cctv.settings.api_key)
-                                .password(true),
-                        )
-                        .changed()
-                    {
-                        credentials_changed = true;
-                    }
-                    self.workspace.app_state.services.its_api_key =
-                        self.its_cctv.settings.api_key.clone();
-                    if credentials_changed {
-                        self.save_service_settings("Saved ITS API key to workspace");
-                    }
-                    let can_import =
-                        self.last_map_query_bounds.is_some() && !self.its_cctv.is_pending();
-                    if ui
-                        .add_enabled(can_import, egui::Button::new("Import visible CCTV"))
-                        .clicked()
-                    {
-                        self.start_its_cctv_import();
-                    }
-                    if ui.button("Clear ITS CCTV layer").clicked() {
-                        self.clear_its_cctv_import_layer();
-                    }
-                    ui.small("Imports current-view CCTV points and HLS URLs from its.go.kr.");
-                    ui.small(&self.its_cctv.status_message);
-                });
-
-                ui.separator();
-                if ui.button("Add marker").clicked() {
-                    if let Some(layer) = self
-                        .workspace
-                        .layers
-                        .iter()
-                        .find(|layer| layer.layer_type == LayerType::Marker)
-                    {
-                        let mut feature = crate::domain::Feature::new(
-                            layer.id.clone(),
-                            crate::domain::FeatureType::Marker,
-                            "New marker",
-                            crate::domain::Geometry::Point(self.workspace.app_state.camera.center),
-                            crate::domain::FeatureStyle::marker(
-                                egui::Color32::WHITE,
-                                egui::Color32::from_rgb(251, 146, 60),
-                                9.0,
-                            ),
-                        );
-                        feature.time_start = Some(Utc::now());
-                        let feature_id = feature.id.clone();
-                        self.apply_command(WorkspaceCommand::AddFeature { feature });
-                        self.interactions.selected_feature_id = Some(feature_id.clone());
-                        self.workspace.app_state.ui.selected_feature_id = Some(feature_id);
-                    }
-                }
             });
+    }
+
+    fn render_settings_window(&mut self, ctx: &Context) {
+        if !self.show_settings_window {
+            return;
+        }
+
+        let mut open = self.show_settings_window;
+        egui::Window::new("Settings")
+            .open(&mut open)
+            .default_width(720.0)
+            .default_height(520.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.set_height(ui.available_height());
+
+                    ui.vertical(|ui| {
+                        ui.set_width(180.0);
+                        ui.label("Providers");
+                        ui.separator();
+                        for page in [
+                            SettingsPage::LiveTraffic,
+                            SettingsPage::Wigle,
+                            SettingsPage::ItsCctv,
+                            SettingsPage::OpenShipData,
+                            SettingsPage::CelesTrak,
+                            SettingsPage::SpaceTrack,
+                        ] {
+                            ui.selectable_value(
+                                &mut self.selected_settings_page,
+                                page,
+                                page.title(),
+                            );
+                        }
+                    });
+
+                    ui.separator();
+
+                    ui.vertical(|ui| {
+                        ui.heading(self.selected_settings_page.title());
+                        ui.separator();
+                        egui::ScrollArea::vertical()
+                            .id_salt("settings_page_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| match self.selected_settings_page {
+                                SettingsPage::LiveTraffic => self.render_live_traffic_settings(ui),
+                                SettingsPage::Wigle => self.render_wigle_settings(ui),
+                                SettingsPage::ItsCctv => self.render_its_cctv_settings(ui),
+                                SettingsPage::OpenShipData => self.render_openshipdata_settings(ui),
+                                SettingsPage::CelesTrak => self.render_celestrak_settings(ui),
+                                SettingsPage::SpaceTrack => self.render_spacetrack_settings(ui),
+                            });
+                    });
+                });
+            });
+        self.show_settings_window = open;
+    }
+
+    fn render_live_traffic_settings(&mut self, ui: &mut egui::Ui) {
+        let mut credentials_changed = false;
+        ui.checkbox(&mut self.traffic.settings.enabled, "Enable live traffic");
+        ui.horizontal(|ui| {
+            ui.small("runtime layer");
+            ui.separator();
+            ui.small(format!("{} aircraft", self.traffic.aircraft_count()));
+            if self.traffic.is_pending() {
+                ui.separator();
+                ui.small("refreshing");
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.selectable_value(
+                &mut self.traffic.settings.filter_mode,
+                TrafficFilterMode::CommercialOnly,
+                "Commercial",
+            );
+            ui.selectable_value(
+                &mut self.traffic.settings.filter_mode,
+                TrafficFilterMode::AllAircraft,
+                "All aircraft",
+            );
+        });
+        ui.checkbox(&mut self.traffic.settings.show_labels, "Traffic labels");
+        ui.add(
+            Slider::new(&mut self.traffic.settings.refresh_interval_secs, 5..=300)
+                .text("Refresh s"),
+        );
+        ui.label("OpenSky client ID");
+        if ui
+            .text_edit_singleline(&mut self.traffic.settings.client_id)
+            .changed()
+        {
+            credentials_changed = true;
+        }
+        ui.label("OpenSky client secret");
+        if ui
+            .add(
+                egui::TextEdit::singleline(&mut self.traffic.settings.client_secret).password(true),
+            )
+            .changed()
+        {
+            credentials_changed = true;
+        }
+        self.workspace.app_state.services.opensky_client_id =
+            self.traffic.settings.client_id.clone();
+        self.workspace.app_state.services.opensky_client_secret =
+            self.traffic.settings.client_secret.clone();
+        if credentials_changed {
+            self.save_service_settings("Saved OpenSky credentials to workspace");
+        }
+        ui.separator();
+        ui.small(&self.traffic.status_message);
+    }
+
+    fn render_wigle_settings(&mut self, ui: &mut egui::Ui) {
+        let mut credentials_changed = false;
+        ui.horizontal(|ui| {
+            ui.small("workspace layer");
+            ui.separator();
+            ui.small(format!("{} networks", wigle_feature_count(&self.workspace)));
+            if self.wigle.is_pending() {
+                ui.separator();
+                ui.small("querying");
+            }
+        });
+        ui.label("WiGLE API name");
+        if ui
+            .text_edit_singleline(&mut self.wigle.settings.api_name)
+            .changed()
+        {
+            credentials_changed = true;
+        }
+        ui.label("WiGLE API token");
+        if ui
+            .add(egui::TextEdit::singleline(&mut self.wigle.settings.api_token).password(true))
+            .changed()
+        {
+            credentials_changed = true;
+        }
+        self.workspace.app_state.services.wigle_api_name = self.wigle.settings.api_name.clone();
+        self.workspace.app_state.services.wigle_api_token = self.wigle.settings.api_token.clone();
+        if credentials_changed {
+            self.save_service_settings("Saved WiGLE credentials to workspace");
+        }
+        let can_import = self.last_map_query_bounds.is_some() && !self.wigle.is_pending();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(can_import, egui::Button::new("Import visible networks"))
+                .clicked()
+            {
+                self.start_wigle_import();
+            }
+            if ui.button("Clear WiGLE layer").clicked() {
+                self.clear_wigle_import_layer();
+            }
+        });
+        ui.small("Imports the current map viewport into a dedicated marker layer.");
+        ui.separator();
+        ui.small(&self.wigle.status_message);
+    }
+
+    fn render_its_cctv_settings(&mut self, ui: &mut egui::Ui) {
+        let mut credentials_changed = false;
+        ui.horizontal(|ui| {
+            ui.small("workspace layer");
+            ui.separator();
+            ui.small(format!(
+                "{} cameras",
+                its_cctv_feature_count(&self.workspace)
+            ));
+            if self.its_cctv.is_pending() {
+                ui.separator();
+                ui.small("querying");
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.selectable_value(
+                &mut self.its_cctv.settings.road_type,
+                ItsRoadType::NationalRoad,
+                "National road",
+            );
+            ui.selectable_value(
+                &mut self.its_cctv.settings.road_type,
+                ItsRoadType::Expressway,
+                "Expressway",
+            );
+        });
+        ui.label("ITS API key");
+        if ui
+            .add(egui::TextEdit::singleline(&mut self.its_cctv.settings.api_key).password(true))
+            .changed()
+        {
+            credentials_changed = true;
+        }
+        self.workspace.app_state.services.its_api_key = self.its_cctv.settings.api_key.clone();
+        if credentials_changed {
+            self.save_service_settings("Saved ITS API key to workspace");
+        }
+        let can_import = self.last_map_query_bounds.is_some() && !self.its_cctv.is_pending();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(can_import, egui::Button::new("Import visible CCTV"))
+                .clicked()
+            {
+                self.start_its_cctv_import();
+            }
+            if ui.button("Clear ITS CCTV layer").clicked() {
+                self.clear_its_cctv_import_layer();
+            }
+        });
+        ui.small("Imports current-view CCTV points and HLS URLs from its.go.kr.");
+        ui.separator();
+        ui.small(&self.its_cctv.status_message);
+    }
+
+    fn render_openshipdata_settings(&mut self, ui: &mut egui::Ui) {
+        let mut credentials_changed = false;
+        ui.horizontal(|ui| {
+            ui.small("workspace layer");
+            ui.separator();
+            ui.small(format!(
+                "{} ships",
+                openshipdata_feature_count(&self.workspace)
+            ));
+            if self.openshipdata.is_pending() {
+                ui.separator();
+                ui.small("querying");
+            }
+        });
+        ui.label("OpenShipData API key");
+        if ui
+            .add(egui::TextEdit::singleline(&mut self.openshipdata.settings.api_key).password(true))
+            .changed()
+        {
+            credentials_changed = true;
+        }
+        self.workspace.app_state.services.openshipdata_api_key =
+            self.openshipdata.settings.api_key.clone();
+        if credentials_changed {
+            self.save_service_settings("Saved OpenShipData API key to workspace");
+        }
+        let can_import = self.last_map_query_bounds.is_some() && !self.openshipdata.is_pending();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(can_import, egui::Button::new("Import visible ships"))
+                .clicked()
+            {
+                self.start_openshipdata_import();
+            }
+            if ui.button("Clear OpenShipData layer").clicked() {
+                self.clear_openshipdata_import_layer();
+            }
+        });
+        ui.small("Imports current-view ship positions from OpenShipData.");
+        ui.separator();
+        ui.small(&self.openshipdata.status_message);
+    }
+
+    fn render_celestrak_settings(&mut self, ui: &mut egui::Ui) {
+        let mut settings_changed = false;
+        ui.horizontal(|ui| {
+            ui.small("workspace layer");
+            ui.separator();
+            ui.small(format!(
+                "{} satellites",
+                satellite_feature_count(&self.workspace, SatelliteSource::CelesTrak)
+            ));
+            if self.celestrak.is_pending() {
+                ui.separator();
+                ui.small("querying");
+            }
+        });
+        ui.label("CelesTrak group");
+        if ui
+            .text_edit_singleline(&mut self.celestrak.settings.group)
+            .changed()
+        {
+            settings_changed = true;
+        }
+        self.workspace.app_state.services.celestrak_group = self.celestrak.settings.group.clone();
+        if settings_changed {
+            self.save_service_settings("Saved CelesTrak settings to workspace");
+        }
+        let can_import = self.last_map_query_bounds.is_some() && !self.celestrak.is_pending();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(can_import, egui::Button::new("Import visible satellites"))
+                .clicked()
+            {
+                self.start_celestrak_import();
+            }
+            if ui.button("Clear CelesTrak layer").clicked() {
+                self.clear_satellite_import_layer(SatelliteSource::CelesTrak);
+            }
+        });
+        ui.small(
+            "Fetches a CelesTrak group, propagates it locally, and imports current-view subpoints.",
+        );
+        ui.separator();
+        ui.small(&self.celestrak.status_message);
+    }
+
+    fn render_spacetrack_settings(&mut self, ui: &mut egui::Ui) {
+        let mut credentials_changed = false;
+        ui.horizontal(|ui| {
+            ui.small("workspace layer");
+            ui.separator();
+            ui.small(format!(
+                "{} satellites",
+                satellite_feature_count(&self.workspace, SatelliteSource::SpaceTrack)
+            ));
+            if self.spacetrack.is_pending() {
+                ui.separator();
+                ui.small("querying");
+            }
+        });
+        ui.label("Space-Track identity");
+        if ui
+            .text_edit_singleline(&mut self.spacetrack.settings.identity)
+            .changed()
+        {
+            credentials_changed = true;
+        }
+        ui.label("Space-Track password");
+        if ui
+            .add(egui::TextEdit::singleline(&mut self.spacetrack.settings.password).password(true))
+            .changed()
+        {
+            credentials_changed = true;
+        }
+        self.workspace.app_state.services.spacetrack_identity =
+            self.spacetrack.settings.identity.clone();
+        self.workspace.app_state.services.spacetrack_password =
+            self.spacetrack.settings.password.clone();
+        if credentials_changed {
+            self.save_service_settings("Saved Space-Track credentials to workspace");
+        }
+        let can_import = self.last_map_query_bounds.is_some() && !self.spacetrack.is_pending();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(can_import, egui::Button::new("Import visible satellites"))
+                .clicked()
+            {
+                self.start_spacetrack_import();
+            }
+            if ui.button("Clear Space-Track layer").clicked() {
+                self.clear_satellite_import_layer(SatelliteSource::SpaceTrack);
+            }
+        });
+        ui.small("Logs into Space-Track, fetches GP data, propagates locally, and imports current-view subpoints.");
+        ui.separator();
+        ui.small(&self.spacetrack.status_message);
     }
 
     fn render_inspector(&mut self, ctx: &Context) {
         SidePanel::right("inspector")
-            .resizable(true)
-            .default_width(320.0)
+            .exact_width(self.inspector_width)
             .show(ctx, |ui| {
-                let selected_aircraft = self
-                    .interactions
-                    .selected_aircraft_icao24
-                    .as_deref()
-                    .and_then(|icao24| self.traffic.aircraft(icao24));
-                show_inspector(
-                    ui,
-                    &mut self.workspace,
-                    &self.interactions,
-                    selected_aircraft,
+                ui.set_width(ui.available_width());
+                ui.set_max_width(ui.available_width());
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let selected_aircraft = self
+                            .interactions
+                            .selected_aircraft_icao24
+                            .as_deref()
+                            .and_then(|icao24| self.traffic.aircraft(icao24));
+                        let selected_feature_id =
+                            self.interactions.selected_feature_id.clone().or_else(|| {
+                                self.workspace.app_state.ui.selected_feature_id.clone()
+                            });
+                        let viewer_target = if selected_aircraft.is_none() {
+                            selected_feature_id
+                                .as_deref()
+                                .and_then(|feature_id| self.workspace.feature(feature_id))
+                                .and_then(viewer_target_from_feature)
+                        } else {
+                            None
+                        };
+                        self.its_cctv_viewer.set_target(viewer_target);
+                        let evidence_preview_target = if selected_aircraft.is_none() {
+                            selected_feature_id
+                                .as_deref()
+                                .and_then(|feature_id| self.workspace.feature(feature_id))
+                                .and_then(evidence_preview_target_from_feature)
+                        } else {
+                            None
+                        };
+                        self.evidence_preview
+                            .set_target(ctx, evidence_preview_target);
+                        show_inspector(
+                            ui,
+                            &mut self.workspace,
+                            &self.interactions,
+                            selected_aircraft,
+                            &mut self.its_cctv_viewer,
+                            &mut self.evidence_preview,
+                            &mut self.status_message,
+                        );
+                    });
+            });
+    }
+
+    fn render_inspector_resize_handle(&mut self, ctx: &Context) {
+        let screen_rect = ctx.screen_rect();
+        let max_width =
+            INSPECTOR_MAX_WIDTH.min((screen_rect.width() - 240.0).max(INSPECTOR_MIN_WIDTH));
+        self.inspector_width = self.inspector_width.clamp(INSPECTOR_MIN_WIDTH, max_width);
+
+        let handle_half_width = 4.0;
+        let boundary_x = screen_rect.right() - self.inspector_width;
+        let handle_pos = egui::pos2(boundary_x - handle_half_width, screen_rect.top());
+        let handle_size = egui::vec2(handle_half_width * 2.0, screen_rect.height());
+
+        egui::Area::new("inspector_resize_handle".into())
+            .order(egui::Order::Foreground)
+            .fixed_pos(handle_pos)
+            .show(ctx, |ui| {
+                let (rect, response) = ui.allocate_exact_size(handle_size, egui::Sense::drag());
+                if response.hovered() || response.dragged() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                }
+                if response.dragged() {
+                    if let Some(pointer) = response.interact_pointer_pos() {
+                        self.inspector_width =
+                            (screen_rect.right() - pointer.x).clamp(INSPECTOR_MIN_WIDTH, max_width);
+                        ui.ctx().request_repaint();
+                    }
+                }
+
+                ui.painter().line_segment(
+                    [
+                        egui::pos2(rect.center().x, rect.top()),
+                        egui::pos2(rect.center().x, rect.bottom()),
+                    ],
+                    egui::Stroke::new(1.0, egui::Color32::from_black_alpha(24)),
                 );
             });
     }
@@ -948,10 +1490,83 @@ impl App for VantageApp {
         let now = Instant::now();
         let delta = now.duration_since(self.last_frame);
         self.last_frame = now;
+        self.its_cctv_viewer.poll(ctx);
+        self.evidence_preview.poll(ctx);
         advance_playback(&mut self.workspace, delta);
         let traffic_changed = self.traffic.drain_results();
+        let celestrak_result = self.celestrak.drain_results();
+        let spacetrack_result = self.spacetrack.drain_results();
+        let openshipdata_result = self.openshipdata.drain_results();
         let its_cctv_result = self.its_cctv.drain_results();
         let wigle_result = self.wigle.drain_results();
+        let mut satellite_changed = false;
+        if let Some(result) = celestrak_result {
+            match result {
+                Ok(query) => {
+                    let import = apply_satellites(&mut self.workspace, query);
+                    self.sync_selection_from_workspace();
+                    self.status_message = match self.save_workspace_quiet() {
+                        Ok(()) => format!(
+                            "Imported {} CelesTrak satellites into layer {}",
+                            import.added_feature_count, import.layer_id
+                        ),
+                        Err(error) => format!(
+                            "Imported {} CelesTrak satellites into layer {} but failed to save: {error}",
+                            import.added_feature_count, import.layer_id
+                        ),
+                    };
+                    satellite_changed = true;
+                }
+                Err(error) => {
+                    self.status_message = error;
+                }
+            }
+        }
+        if let Some(result) = spacetrack_result {
+            match result {
+                Ok(query) => {
+                    let import = apply_satellites(&mut self.workspace, query);
+                    self.sync_selection_from_workspace();
+                    self.status_message = match self.save_workspace_quiet() {
+                        Ok(()) => format!(
+                            "Imported {} Space-Track satellites into layer {}",
+                            import.added_feature_count, import.layer_id
+                        ),
+                        Err(error) => format!(
+                            "Imported {} Space-Track satellites into layer {} but failed to save: {error}",
+                            import.added_feature_count, import.layer_id
+                        ),
+                    };
+                    satellite_changed = true;
+                }
+                Err(error) => {
+                    self.status_message = error;
+                }
+            }
+        }
+        let mut openshipdata_changed = false;
+        if let Some(result) = openshipdata_result {
+            match result {
+                Ok(query) => {
+                    let import = apply_openshipdata(&mut self.workspace, query);
+                    self.sync_selection_from_workspace();
+                    self.status_message = match self.save_workspace_quiet() {
+                        Ok(()) => format!(
+                            "Imported {} OpenShipData ships into layer {}",
+                            import.added_feature_count, import.layer_id
+                        ),
+                        Err(error) => format!(
+                            "Imported {} OpenShipData ships into layer {} but failed to save: {error}",
+                            import.added_feature_count, import.layer_id
+                        ),
+                    };
+                    openshipdata_changed = true;
+                }
+                Err(error) => {
+                    self.status_message = error;
+                }
+            }
+        }
         let mut its_cctv_changed = false;
         if let Some(result) = its_cctv_result {
             match result {
@@ -1002,10 +1617,14 @@ impl App for VantageApp {
             let fps = self.workspace.app_state.timeline.playback_fps_cap.max(1);
             ctx.request_repaint_after(Duration::from_secs_f64(1.0 / fps as f64));
         }
+        if self.its_cctv_viewer.is_active() {
+            ctx.request_repaint_after(self.its_cctv_viewer.repaint_interval());
+        }
         self.handle_shortcuts(ctx);
 
         self.render_top_bar(ctx);
         self.render_layer_panel(ctx);
+        self.render_settings_window(ctx);
         self.render_timeline(ctx);
 
         let previous_feature_selection = self.workspace.app_state.ui.selected_feature_id.clone();
@@ -1086,6 +1705,12 @@ impl App for VantageApp {
             if traffic_changed {
                 ctx.request_repaint();
             }
+            if satellite_changed {
+                ctx.request_repaint();
+            }
+            if openshipdata_changed {
+                ctx.request_repaint();
+            }
             if its_cctv_changed {
                 ctx.request_repaint();
             }
@@ -1095,6 +1720,7 @@ impl App for VantageApp {
         });
 
         self.render_inspector(ctx);
+        self.render_inspector_resize_handle(ctx);
         self.autosave_view_state_if_due(now);
 
         if traffic_changed {
@@ -1109,12 +1735,18 @@ impl App for VantageApp {
 
         if self.workspace.app_state.ui.selected_feature_id != previous_feature_selection
             || self.interactions.selected_aircraft_icao24 != previous_aircraft_selection
+            || satellite_changed
+            || openshipdata_changed
             || its_cctv_changed
             || wigle_changed
         {
             ctx.request_repaint();
         }
     }
+}
+
+fn is_supported_evidence_extension(extension: &str) -> bool {
+    matches!(extension, "jpg" | "jpeg" | "png")
 }
 
 fn default_workspace_path() -> PathBuf {

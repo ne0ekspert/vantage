@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use egui::Color32;
 use serde_json::json;
 
+use super::merge_imported_features;
 use crate::domain::{
     Feature, FeatureStyle, FeatureType, GeoPoint, Geometry, Layer, LayerType, Workspace,
 };
@@ -17,22 +18,24 @@ pub struct ItsCctvImportResult {
 
 pub fn apply_its_cctv(workspace: &mut Workspace, query: ItsCctvQueryResult) -> ItsCctvImportResult {
     let layer_id = ensure_its_cctv_layer(workspace);
-    workspace
-        .features
-        .retain(|feature| feature.layer_id != layer_id);
 
     let fetched_at = query.fetched_at;
     let road_type = query.road_type;
-    let mut selected_feature_id = None;
-    for camera in query.cameras {
-        let feature = its_cctv_feature(&layer_id, camera, road_type, fetched_at);
-        if selected_feature_id.is_none() {
-            selected_feature_id = Some(feature.id.clone());
-        }
-        workspace.features.push(feature);
+    let selected_feature_id = merge_imported_features(
+        workspace,
+        &layer_id,
+        query.cameras.into_iter().map(|camera| {
+            let key = its_cctv_record_key(&camera);
+            let feature = its_cctv_feature(&layer_id, camera, road_type, fetched_at, &key);
+            (key, feature)
+        }),
+        its_cctv_feature_key,
+    );
+
+    if selected_feature_id.is_some() {
+        workspace.app_state.ui.selected_feature_id = selected_feature_id;
     }
 
-    workspace.app_state.ui.selected_feature_id = selected_feature_id;
     workspace.recalculate_timeline_bounds();
 
     ItsCctvImportResult {
@@ -120,6 +123,7 @@ fn its_cctv_feature(
     camera: ItsCctvCamera,
     road_type: ItsRoadType,
     fetched_at: DateTime<Utc>,
+    record_key: &str,
 ) -> Feature {
     let mut feature = Feature::new(
         layer_id.to_owned(),
@@ -138,6 +142,7 @@ fn its_cctv_feature(
     );
     feature.metadata_json = json!({
         "source": "its_cctv",
+        "provider_record_key": record_key,
         "road_type": road_type.as_api_value(),
         "name": camera.name,
         "stream_url": camera.stream_url,
@@ -153,6 +158,75 @@ fn its_cctv_feature(
     feature
 }
 
+fn its_cctv_record_key(camera: &ItsCctvCamera) -> String {
+    if let Some(road_section_id) = camera
+        .road_section_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return format!("road_section:{road_section_id}");
+    }
+    if !camera.stream_url.trim().is_empty() {
+        return format!("stream:{}", camera.stream_url.trim().to_ascii_lowercase());
+    }
+
+    format!(
+        "camera:{}:{:.5}:{:.5}",
+        camera.name.trim().to_ascii_lowercase(),
+        camera.lat,
+        camera.lon
+    )
+}
+
+fn its_cctv_feature_key(feature: &Feature) -> Option<String> {
+    feature
+        .metadata_json
+        .get("provider_record_key")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
+        .or_else(|| {
+            feature
+                .metadata_json
+                .get("roadsectionid")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|road_section_id| format!("road_section:{road_section_id}"))
+        })
+        .or_else(|| {
+            feature
+                .metadata_json
+                .get("stream_url")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|stream_url| format!("stream:{}", stream_url.to_ascii_lowercase()))
+        })
+        .or_else(|| {
+            let lat = feature
+                .metadata_json
+                .get("coordy")
+                .and_then(|value| value.as_f64())?;
+            let lon = feature
+                .metadata_json
+                .get("coordx")
+                .and_then(|value| value.as_f64())?;
+            let name = feature
+                .metadata_json
+                .get("name")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            Some(format!(
+                "camera:{}:{:.5}:{:.5}",
+                name.to_ascii_lowercase(),
+                lat,
+                lon
+            ))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
@@ -162,7 +236,7 @@ mod tests {
     use crate::its_cctv::{ItsCctvCamera, ItsCctvQueryResult, ItsRoadType};
 
     #[test]
-    fn apply_its_cctv_reuses_single_layer_and_replaces_features() {
+    fn apply_its_cctv_preserves_existing_features_and_updates_matches() {
         let mut workspace = sample_workspace();
         let first = apply_its_cctv(
             &mut workspace,
@@ -188,21 +262,48 @@ mod tests {
             ItsCctvQueryResult {
                 road_type: ItsRoadType::Expressway,
                 fetched_at: Utc::now(),
-                cameras: vec![ItsCctvCamera {
-                    name: "Camera B".into(),
-                    stream_url: "https://example.com/b.m3u8".into(),
-                    lat: 37.6,
-                    lon: 127.0,
-                    format: Some("HLS".into()),
-                    cctv_type: Some("4".into()),
-                    resolution: None,
-                    road_section_id: None,
-                    created_at: None,
-                }],
+                cameras: vec![
+                    ItsCctvCamera {
+                        name: "Camera A Updated".into(),
+                        stream_url: "https://example.com/a.m3u8".into(),
+                        lat: 37.55,
+                        lon: 126.95,
+                        format: Some("HLS".into()),
+                        cctv_type: Some("4".into()),
+                        resolution: Some("1920x1080".into()),
+                        road_section_id: Some("001".into()),
+                        created_at: Some("2026-03-18 10:00:00".into()),
+                    },
+                    ItsCctvCamera {
+                        name: "Camera B".into(),
+                        stream_url: "https://example.com/b.m3u8".into(),
+                        lat: 37.6,
+                        lon: 127.0,
+                        format: Some("HLS".into()),
+                        cctv_type: Some("4".into()),
+                        resolution: None,
+                        road_section_id: None,
+                        created_at: None,
+                    },
+                ],
             },
         );
 
         assert_eq!(first.layer_id, second.layer_id);
-        assert_eq!(its_cctv_feature_count(&workspace), 1);
+        assert_eq!(its_cctv_feature_count(&workspace), 2);
+        let updated = workspace
+            .features
+            .iter()
+            .find(|feature| {
+                feature.layer_id == first.layer_id
+                    && feature.metadata_json["stream_url"].as_str()
+                        == Some("https://example.com/a.m3u8")
+            })
+            .expect("updated camera should exist");
+        assert_eq!(updated.name, "Camera A Updated");
+        assert_eq!(
+            updated.metadata_json["resolution"].as_str(),
+            Some("1920x1080")
+        );
     }
 }

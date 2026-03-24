@@ -57,7 +57,7 @@ impl MapProjector {
         let eye = Mat3::from_rotation_y(yaw) * eye_local;
         let forward = (-eye).normalize();
         let up_hint = if forward.dot(Vec3::Y).abs() > 0.98 {
-            Mat3::from_rotation_y(yaw) * Vec3::Z
+            Mat3::from_rotation_y(yaw) * -Vec3::Z
         } else {
             Vec3::Y
         };
@@ -253,4 +253,49 @@ fn world_to_lat_lon(world: Vec2, world_size: f32) -> GeoPoint {
 fn mercator_meters_per_pixel(latitude_deg: f32, zoom: f32) -> f32 {
     let latitude = latitude_deg.to_radians().cos().abs().max(0.05);
     156_543.03392 * latitude / 2.0_f32.powf(zoom)
+}
+
+#[cfg(test)]
+mod tests {
+    use egui::Rect;
+
+    use super::MapProjector;
+    use crate::domain::{sample_workspace, GeoPoint};
+
+    #[test]
+    fn north_stays_above_south_at_low_tilt() {
+        let mut workspace = sample_workspace();
+        workspace.app_state.camera.center = GeoPoint {
+            lat: 37.5665,
+            lon: 126.9780,
+            altitude_m: Some(0.0),
+        };
+        workspace.app_state.camera.tilt_degrees = 5.0;
+        workspace.app_state.camera.bearing_degrees = 0.0;
+
+        let projector = MapProjector::new(
+            Rect::from_x_y_ranges(0.0..=800.0, 0.0..=600.0),
+            &workspace,
+            256.0,
+        );
+        let north = projector
+            .geo_to_screen(GeoPoint {
+                lat: workspace.app_state.camera.center.lat + 0.01,
+                lon: workspace.app_state.camera.center.lon,
+                altitude_m: Some(0.0),
+            })
+            .expect("north point should project");
+        let south = projector
+            .geo_to_screen(GeoPoint {
+                lat: workspace.app_state.camera.center.lat - 0.01,
+                lon: workspace.app_state.camera.center.lon,
+                altitude_m: Some(0.0),
+            })
+            .expect("south point should project");
+
+        assert!(
+            north.y < south.y,
+            "north should remain above south at low tilt"
+        );
+    }
 }

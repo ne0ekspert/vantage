@@ -351,6 +351,10 @@ mod tests {
         workspace.app_state.services.wigle_api_name = "wigle-name".into();
         workspace.app_state.services.wigle_api_token = "wigle-token".into();
         workspace.app_state.services.its_api_key = "its-key".into();
+        workspace.app_state.services.openshipdata_api_key = "openship-key".into();
+        workspace.app_state.services.celestrak_group = "stations".into();
+        workspace.app_state.services.spacetrack_identity = "space-user".into();
+        workspace.app_state.services.spacetrack_password = "space-pass".into();
 
         let db_path = env::temp_dir().join(format!("vantage-{}.sqlite", Uuid::new_v4()));
         let store = SqliteWorkspaceStore;
@@ -374,6 +378,13 @@ mod tests {
         assert_eq!(loaded.app_state.services.wigle_api_name, "wigle-name");
         assert_eq!(loaded.app_state.services.wigle_api_token, "wigle-token");
         assert_eq!(loaded.app_state.services.its_api_key, "its-key");
+        assert_eq!(
+            loaded.app_state.services.openshipdata_api_key,
+            "openship-key"
+        );
+        assert_eq!(loaded.app_state.services.celestrak_group, "stations");
+        assert_eq!(loaded.app_state.services.spacetrack_identity, "space-user");
+        assert_eq!(loaded.app_state.services.spacetrack_password, "space-pass");
 
         let _ = fs::remove_file(db_path);
     }
